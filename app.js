@@ -4,7 +4,7 @@ import {
   signOut, onAuthStateChanged, updatePassword, EmailAuthProvider, reauthenticateWithCredential,
 } from 'https://www.gstatic.com/firebasejs/12.19.0/firebase-auth.js';
 import {
-  getFirestore, doc, getDoc, updateDoc, collection, query, where, onSnapshot,
+  getFirestore, doc, getDoc, setDoc, updateDoc, collection, query, where, onSnapshot,
   writeBatch, addDoc, serverTimestamp, deleteField,
 } from 'https://www.gstatic.com/firebasejs/12.19.0/firebase-firestore.js';
 import * as C from './calc.js';
@@ -98,6 +98,25 @@ const STATUS = { pending: 'მოლოდინში', approved: 'დადა
 function sortReqs(list) { return [...list].sort((a, b) => (b.dates?.[0] || '').localeCompare(a.dates?.[0] || '')); }
 function yearSelect(id, val, list = years()) {
   return `<select id="${id}" style="width:auto">${list.map(y => `<option ${y === val ? 'selected' : ''}>${y}</option>`).join('')}</select>`;
+}
+// ───────── Telegram შეტყობინებები ─────────
+const SITE_URL = 'https://salomechik.github.io/shvebuleba/';
+async function tgSend(token, chatId, text) {
+  // form-urlencoded, რომ ბრაუზერმა preflight არ გააგზავნოს (Telegram მას არ უჭერს მხარს)
+  const r = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+    method: 'POST',
+    body: new URLSearchParams({ chat_id: String(chatId), text, disable_web_page_preview: 'true' }),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!j.ok) throw new Error(j.description || 'Telegram error');
+}
+async function notifyAdmins(text) {
+  try {
+    const s = await getDoc(doc(db, 'settings', 'telegram'));
+    const t = s.exists() ? s.data() : null;
+    if (!t?.token || !t.chats?.length) return;
+    await Promise.allSettled(t.chats.map(c => tgSend(t.token, c.id, text)));
+  } catch (e) { console.warn('Telegram:', e); }
 }
 function stopAll() { S.unsub.forEach(u => u()); S.unsub = []; }
 
@@ -369,12 +388,16 @@ function renderMine(host, emp) {
     send.disabled = true;
     try {
       const g = C.groupByYear(F.sel);
+      const lines = [];
       for (const yy of Object.keys(g)) {
         await addDoc(collection(db, 'requests'), {
           empId: emp.id, uid: S.user.uid, name: emp.name, type: F.type, dates: g[yy], year: +yy,
           status: 'pending', comment: F.comment.trim(), createdAt: serverTimestamp(),
         });
+        lines.push(`${C.fmtRanges(g[yy])}, ${yy} (${g[yy].length} სამუშაო დღე)`);
       }
+      notifyAdmins(`🗓 ახალი მოთხოვნა\n${emp.name} — ${C.TYPES[F.type]}\n${lines.join('\n')}`
+        + (F.comment.trim() ? `\nკომენტარი: ${F.comment.trim()}` : '') + `\n\nდასადასტურებლად: ${SITE_URL}`);
       F.sel.clear(); F.comment = '';
       toast('მოთხოვნა გაიგზავნა. დაელოდეთ დადასტურებას.');
     } catch (e) { $('#fErr', host).textContent = errText(e); send.disabled = false; }
@@ -579,7 +602,9 @@ function editEmpModal(id) {
     ${isSelf ? '' : `<details><summary style="cursor:pointer;font-weight:600">ახალი პაროლის მინიჭება</summary>
       <div class="stack" style="margin-top:12px"><label class="f">ახალი პაროლი (მინ. 6 სიმბოლო)<input type="text" id="ePw"></label>
       <button class="btn dark" id="ePwGo">მინიჭება</button></div></details>
-    <button class="btn ghost" id="eAct">${e.active ? 'თანამშრომლის გამორთვა' : 'თანამშრომლის ჩართვა'}</button>`}`);
+    <div class="row">
+      ${e.active ? `<button class="btn ghost" id="eRole">${e.role === 'admin' ? 'ადმინობის მოხსნა' : 'ადმინად დანიშვნა'}</button>` : ''}
+      <button class="btn ghost" id="eAct">${e.active ? 'თანამშრომლის გამორთვა' : 'თანამშრომლის ჩართვა'}</button></div>`}`);
   $('#eX', m).onclick = () => m.remove();
   const reqsBox = $('#eReqs', m);
   const drawReqs = () => {
@@ -641,6 +666,20 @@ function editEmpModal(id) {
       toast('ახალი პაროლი მიენიჭა.'); m.remove();
     } catch (x) { toast(errText(x)); }
   };
+  const roleBtn = $('#eRole', m);
+  if (roleBtn) roleBtn.onclick = async () => {
+    const toAdmin = e.role !== 'admin';
+    if (!confirm(toAdmin
+      ? `დავნიშნო ${e.name} ადმინად? ნახავს ყველას მონაცემებს და შეძლებს მოთხოვნების დადასტურებას.`
+      : `მოვუხსნა ${e.name}-ს ადმინობა? დარჩება ჩვეულებრივ თანამშრომლად.`)) return;
+    try {
+      const role = toAdmin ? 'admin' : 'employee';
+      const b = writeBatch(db);
+      b.update(doc(db, 'employees', e.id), toAdmin ? { role, track: true } : { role });
+      b.set(doc(db, 'uidmap', e.uid), { empId: e.id, role });
+      await b.commit(); toast(toAdmin ? 'დაინიშნა ადმინად. ცვლილება ძალაშია შემდეგი შესვლიდან.' : 'ადმინობა მოეხსნა.'); m.remove();
+    } catch (x) { toast(errText(x)); }
+  };
   $('#eAct', m).onclick = async () => {
     const on = !e.active;
     if (!confirm(on ? `ჩავრთო ${e.name}?` : `გამოვრთო ${e.name}? ვეღარ შევა სისტემაში. ჩანაწერები შეინახება.`)) return;
@@ -671,8 +710,10 @@ function renderSettings(host) {
       <div class="row"><input type="date" id="hD" min="${hy}-01-01" max="${hy}-12-31" style="width:auto"><input type="text" id="hN" placeholder="დასახელება" style="flex:1;min-width:160px"><button class="btn dark" id="hAdd">დამატება</button></div>
       ${custom ? '<div><button class="btn ghost sm" id="hReset">კოდექსის სიაზე დაბრუნება</button></div>' : ''}
     </div>
+    <div class="card stack" id="tgCard"><h3>Telegram შეტყობინებები</h3><p class="muted small">იტვირთება…</p></div>
     ${pwCard()}
   </div>`;
+  renderTelegram($('#tgCard', host));
   $('#gSave', host).onclick = async () => {
     const v = Math.max(0, Math.floor(+$('#gV', host).value || 0)), d = Math.max(0, Math.floor(+$('#gD', host).value || 0));
     try { await updateDoc(doc(db, 'settings', 'config'), { vacationDays: v, dayoffDays: d }); toast('შენახულია.'); } catch (e) { toast(errText(e)); }
@@ -695,4 +736,60 @@ function renderSettings(host) {
   };
   const r = $('#hReset', host); if (r) r.onclick = () => { if (confirm('დავაბრუნო კოდექსის სია?')) saveH(null); };
   bindPw(host);
+}
+
+// ───────── ადმინი: Telegram-ის პარამეტრები ─────────
+S.tg = null; // { token, chats:[{id,name}], found:[{id,name}] }
+async function renderTelegram(box) {
+  if (!S.tg) {
+    try { const s = await getDoc(doc(db, 'settings', 'telegram')); S.tg = { token: '', chats: [], ...(s.exists() ? s.data() : {}), found: [] }; }
+    catch (e) { box.innerHTML = `<h3>Telegram შეტყობინებები</h3><p class="err">${esc(errText(e))}</p>`; return; }
+  }
+  if (!box.isConnected) return;
+  const T = S.tg;
+  const all = [...T.chats];
+  for (const f of T.found) if (!all.some(c => String(c.id) === String(f.id))) all.push(f);
+  box.innerHTML = `<h3>Telegram შეტყობინებები</h3>
+    <p class="small muted">ახალი მოთხოვნისას შეტყობინება მოვა მონიშნულ ადამიანებს Telegram-ში.</p>
+    <label class="f">ბოტის ტოკენი (BotFather-იდან)<input type="password" id="tgTok" value="${esc(T.token)}" placeholder="123456789:AA…" autocomplete="off"></label>
+    <div class="note small">ყოველმა მიმღებმა Telegram-ში უნდა გახსნას ბოტი და დააჭიროს <b>Start</b>. შემდეგ აქ დააჭირეთ „მიმღებების მოძებნა“.</div>
+    <div class="row"><button class="btn ghost sm" id="tgFind">მიმღებების მოძებნა</button></div>
+    <div id="tgList">${all.length ? all.map(c => `<label class="row small" style="padding:6px 0"><input type="checkbox" data-tgc="${esc(c.id)}" data-name="${esc(c.name)}" ${T.chats.some(x => String(x.id) === String(c.id)) ? 'checked' : ''}> ${esc(c.name)}</label>`).join('') : '<p class="small muted">მიმღებები ჯერ არ არის.</p>'}</div>
+    <div class="err" id="tgErr"></div>
+    <div class="row"><button class="btn" id="tgSave">შენახვა</button><button class="btn ghost" id="tgTest">სატესტო შეტყობინება</button></div>`;
+  const tok = () => $('#tgTok', box).value.trim();
+  const err = $('#tgErr', box);
+  $('#tgTok', box).oninput = e => { T.token = e.target.value.trim(); };
+  $('#tgFind', box).onclick = async () => {
+    err.textContent = '';
+    if (!tok()) { err.textContent = 'ჯერ ჩაწერეთ ტოკენი.'; return; }
+    try {
+      const j = await (await fetch(`https://api.telegram.org/bot${tok()}/getUpdates`)).json();
+      if (!j.ok) throw new Error(j.description);
+      const m = new Map();
+      for (const u of j.result || []) {
+        const c = (u.message || u.my_chat_member || {}).chat;
+        if (c && c.type === 'private') m.set(String(c.id), [c.first_name, c.last_name].filter(Boolean).join(' ') + (c.username ? ` (@${c.username})` : ''));
+      }
+      T.found = [...m].map(([id, name]) => ({ id, name }));
+      await renderTelegram(box);
+      if (!T.found.length) $('#tgErr', box).textContent = 'ვერავინ მოიძებნა. ბოტში დააჭირეთ Start (ან მისწერეთ ნებისმიერი ტექსტი) და სცადეთ ხელახლა.';
+    } catch (e) { err.textContent = 'ტოკენი არასწორია ან კავშირი ვერ დამყარდა.'; }
+  };
+  const picked = () => $$('[data-tgc]', box).filter(i => i.checked).map(i => ({ id: i.dataset.tgc, name: i.dataset.name }));
+  $('#tgSave', box).onclick = async () => {
+    try {
+      const data = { token: tok(), chats: picked() };
+      await setDoc(doc(db, 'settings', 'telegram'), data);
+      Object.assign(T, data); toast('შენახულია.');
+    } catch (e) { err.textContent = errText(e); }
+  };
+  $('#tgTest', box).onclick = async () => {
+    err.textContent = '';
+    const cs = picked();
+    if (!tok() || !cs.length) { err.textContent = 'ჩაწერეთ ტოკენი და მონიშნეთ მიმღები.'; return; }
+    const res = await Promise.allSettled(cs.map(c => tgSend(tok(), c.id, '✅ სატესტო შეტყობინება — ალისფერი აფრები, შვებულებების აღრიცხვა')));
+    const bad = res.filter(x => x.status === 'rejected').length;
+    if (bad) err.textContent = `${bad} მიმღებთან ვერ გაიგზავნა.`; else toast('გაიგზავნა. შეამოწმეთ Telegram.');
+  };
 }

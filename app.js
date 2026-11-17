@@ -516,7 +516,7 @@ function renderEmps(host) {
   const list = S.employees.filter(e => (S.showOff || e.active) && (e.role !== 'admin' || e.track || S.showOff));
   const offCount = S.employees.filter(e => !e.active).length;
   host.innerHTML = `<div class="stack">
-    <div class="row spread"><h2>თანამშრომლები</h2><div class="row">${yearSelect('ySel', y)}<button class="btn" id="add">+ დამატება</button></div></div>
+    <div class="row spread"><h2>თანამშრომლები</h2><div class="row">${yearSelect('ySel', y)}<button class="btn ghost" id="xls">Excel-ში გადმოწერა</button><button class="btn" id="add">+ დამატება</button></div></div>
     <div class="tbl-wrap"><table><thead><tr><th>სახელი</th><th>Username</th><th>შვებ. დარჩ.</th><th>გამოყ. / სულ</th><th>დეი ოფი დარჩ.</th><th>გამოყ. / სულ</th><th>მოლოდ.</th><th></th></tr></thead><tbody>
     ${list.map(e => {
       const v = bal(e, 'vacation', y), d = bal(e, 'dayoff', y);
@@ -532,6 +532,7 @@ function renderEmps(host) {
   </div>`;
   $('#ySel', host).onchange = e => { S.year = +e.target.value; renderEmps(host); };
   $('#add', host).onclick = addEmpModal;
+  $('#xls', host).onclick = e => exportExcel(e.currentTarget);
   const so = $('#showOff', host); if (so) so.onchange = e => { S.showOff = e.target.checked; renderEmps(host); };
   $$('[data-edit]', host).forEach(b => b.onclick = () => editEmpModal(b.dataset.edit));
 }
@@ -736,6 +737,46 @@ function renderSettings(host) {
   };
   const r = $('#hReset', host); if (r) r.onclick = () => { if (confirm('დავაბრუნო კოდექსის სია?')) saveH(null); };
   bindPw(host);
+}
+
+// ───────── ადმინი: Excel-ში გადმოწერა (სარეზერვო ასლი) ─────────
+async function exportExcel(btn) {
+  btn.disabled = true;
+  try {
+    const X = await import('https://cdn.sheetjs.com/xlsx-0.20.3/package/xlsx.mjs');
+    const wb = X.utils.book_new();
+    const emps = S.employees;
+    const ys = [...new Set([...years(), ...S.requests.map(r => +r.year)])].sort();
+    // ნაშთები — თითო წელზე ცალკე ფურცელი
+    for (const y of ys) {
+      const rows = emps.filter(e => e.role !== 'admin' || e.track).map(e => {
+        const v = bal(e, 'vacation', y), d = bal(e, 'dayoff', y);
+        return {
+          'სახელი': e.name, 'Username': e.username, 'სტატუსი': e.active ? 'აქტიური' : 'გამორთული',
+          'შვებულება — სულ': v.quota, 'შვებულება — გამოყენებული': v.used, 'შვებულება — მოლოდინში': v.pending, 'შვებულება — დარჩენილი': v.left,
+          'დეი ოფი — სულ': d.quota, 'დეი ოფი — გამოყენებული': d.used, 'დეი ოფი — მოლოდინში': d.pending, 'დეი ოფი — დარჩენილი': d.left,
+        };
+      });
+      const ws = X.utils.json_to_sheet(rows);
+      ws['!cols'] = [{ wch: 26 }, { wch: 14 }, { wch: 11 }, ...Array(8).fill({ wch: 13 })];
+      X.utils.book_append_sheet(wb, ws, `ნაშთები ${y}`);
+    }
+    // ყველა ჩანაწერი
+    const ts = t => t?.seconds ? new Date(t.seconds * 1000).toLocaleString('ka-GE') : '';
+    const recs = [...S.requests].sort((a, b) => (a.dates?.[0] || '').localeCompare(b.dates?.[0] || '')).map(r => ({
+      'სახელი': r.name, 'ტიპი': C.TYPES[r.type], 'სტატუსი': STATUS[r.status], 'წელი': +r.year,
+      'პირველი დღე': (r.dates || [])[0] || '', 'ბოლო დღე': (r.dates || []).slice(-1)[0] || '',
+      'თარიღები': C.fmtRanges(r.dates || []), 'სამუშაო დღე': workdays(r),
+      'კომენტარი': r.comment || '', 'ადმინის შენიშვნა': r.adminNote || '', 'გადაწყვიტა': r.decidedBy || '',
+      'მოთხოვნის დრო': ts(r.createdAt), 'გადაწყვეტის დრო': ts(r.decidedAt), 'ყველა დღე': (r.dates || []).join(', '),
+    }));
+    const ws2 = X.utils.json_to_sheet(recs.length ? recs : [{ 'სახელი': 'ჩანაწერები არ არის' }]);
+    ws2['!cols'] = [{ wch: 26 }, { wch: 11 }, { wch: 13 }, { wch: 7 }, { wch: 12 }, { wch: 12 }, { wch: 34 }, { wch: 12 }, { wch: 30 }, { wch: 30 }, { wch: 22 }, { wch: 20 }, { wch: 20 }, { wch: 60 }];
+    X.utils.book_append_sheet(wb, ws2, 'ჩანაწერები');
+    X.writeFile(wb, `შვებულებები_${C.todayIso()}.xlsx`);
+    toast('ფაილი გადმოიწერა.');
+  } catch (e) { toast('ვერ გადმოიწერა: ' + (e?.message || e)); }
+  btn.disabled = false;
 }
 
 // ───────── ადმინი: Telegram-ის პარამეტრები ─────────
